@@ -30,8 +30,8 @@ import {
   makeGrokAdapterV2,
 } from "../src/orchestration-v2/Adapters/GrokAdapterV2.ts";
 import { ACP_PROTOCOL } from "../src/orchestration-v2/Adapters/AcpAdapterV2.ts";
-import { layer as idAllocatorLayer, IdAllocatorV2 } from "../src/orchestration-v2/IdAllocator.ts";
-import { makeLayerEffect as makeProviderAdapterRegistryLayerEffect } from "../src/orchestration-v2/ProviderAdapterRegistry.ts";
+import * as IdAllocator from "../src/orchestration-v2/IdAllocator.ts";
+import * as ProviderAdapterRegistry from "../src/orchestration-v2/ProviderAdapterRegistry.ts";
 import { provideDeterministicTestRuntime } from "../src/orchestration-v2/testkit/DeterministicRuntime.ts";
 import { ORCHESTRATOR_REPLAY_FIXTURES } from "../src/orchestration-v2/testkit/fixtures/index.ts";
 import { materializeFixtureInput } from "../src/orchestration-v2/testkit/fixtures/shared.ts";
@@ -357,7 +357,7 @@ const recordScenario = Effect.fn("recordGrokScenario")(function* (fixtureName: s
     fixtureInput,
     driver: GROK_PROVIDER,
     modelSelection: variant.modelSelection,
-  }).pipe(Effect.provide(idAllocatorLayer), provideDeterministicTestRuntime);
+  }).pipe(Effect.provide(IdAllocator.layer), provideDeterministicTestRuntime);
   const scenario = {
     name: `${fixtureName}/grok-record`,
     commands: materialized.commands,
@@ -368,7 +368,7 @@ const recordScenario = Effect.fn("recordGrokScenario")(function* (fixtureName: s
 
   const tee = makeWireTee();
   const settings = { ...DEFAULT_GROK_SETTINGS, binaryPath: process.env.T3_GROK_BIN ?? "grok" };
-  const registryLayer = makeProviderAdapterRegistryLayerEffect(
+  const registryLayer = ProviderAdapterRegistry.makeLayerEffect(
     Effect.gen(function* () {
       const childProcessSpawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const environment = yield* HostProcessEnvironment;
@@ -381,7 +381,7 @@ const recordScenario = Effect.fn("recordGrokScenario")(function* (fixtureName: s
           childProcessSpawner,
           crypto: yield* Crypto.Crypto,
           fileSystem: yield* FileSystem.FileSystem,
-          idAllocator: yield* IdAllocatorV2,
+          idAllocator: yield* IdAllocator.IdAllocatorV2,
           serverConfig: yield* ServerConfig,
           selfInvocation: yield* resolveSelfInvocation(),
           // Production's runtime factory, with the protocol logger teeing raw lines.
@@ -404,7 +404,7 @@ const recordScenario = Effect.fn("recordGrokScenario")(function* (fixtureName: s
           Layer.provide(NodeServices.layer),
         ),
         NodeServices.layer,
-        idAllocatorLayer,
+        IdAllocator.layer,
       ),
     ),
   );
