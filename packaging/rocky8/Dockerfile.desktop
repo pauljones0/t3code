@@ -1,0 +1,143 @@
+# syntax=docker/dockerfile:1
+# T3 Code DESKTOP (Electron AppImage) built on Rocky Linux 8.10.
+#
+# The stock Linux artifact has three Rocky 8 (glibc 2.28) blockers, all native:
+#   1. node-pty compiles from source (no Linux prebuilds) and needs C++20 for
+#      Electron 44's headers; Rocky 8 ships GCC 8.5. Fixed with gcc-toolset-13
+#      (electron-builder's npmRebuild compiles it during packaging).
+#   2. @ff-labs/fff-bin-linux-x64-gnu targets glibc >= 2.31. Fixed by rebuilding
+#      libfff_c.so from the exact tagged source, swapped into the desktop stage
+#      via T3CODE_DESKTOP_NATIVE_OVERRIDE_DIR (see scripts/build-desktop-artifact.ts).
+#   3. @crowecawcaw/xa11y-linux-x64-gnu targets glibc >= 2.39. Same treatment:
+#      rebuilt with napi from the exact tagged source, swapped the same way.
+#
+# Electron 44 itself, the ffi-rs and keyring napi bindings, resource-monitor,
+# the capture helpers, and browser-secret all build/run on 8.10 unmodified
+# (helpers compile here from source).
+#
+# Build (context = repo root; default target selftests the AppImage):
+#   docker build -f packaging/rocky8/Dockerfile.desktop -t t3desk-rocky8:local .
+# The AppImage lands in /opt/t3desk/ inside the image. Extract it with:
+#   id="$(docker create t3desk-rocky8:local)" && docker cp "$id:/opt/t3desk/." .
+#
+# Run on a Rocky 8.10 desktop (see README.md for the host package list):
+#   ./T3-Code-<version>-x64.AppImage
+
+ARG ROCKY_VERSION=8.10
+ARG NODE_VERSION=24.21.0
+ARG RUST_TOOLCHAIN=1.90.0
+ARG ZIG_VERSION=0.16.0
+ARG FFF_TAG=v0.9.4
+ARG XA11Y_TAG=v0.13.0
+
+# ---------------------------------------------------------------------------
+# Stage: node-base — Rocky 8.10 + upstream Node (shared by builder + tester).
+# ---------------------------------------------------------------------------
+FROM rockylinux/rockylinux:${ROCKY_VERSION} AS node-base
+ARG NODE_VERSION
+RUN dnf install -y curl tar xz gzip ca-certificates \
+  && dnf clean all \
+  && rm -rf /var/cache/dnf
+RUN curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz" \
+  && tar -xJf "node-v${NODE_VERSION}-linux-x64.tar.xz" -C /usr/local --strip-components=1 \
+  && rm "node-v${NODE_VERSION}-linux-x64.tar.xz" \
+  && node --version
+
+# ---------------------------------------------------------------------------
+# Stage: builder — full monorepo + Linux AppImage, all on Rocky 8.10.
+# ---------------------------------------------------------------------------
+FROM node-base AS builder
+ARG RUST_TOOLCHAIN
+ARG ZIG_VERSION
+ARG FFF_TAG
+ARG XA11Y_TAG
+
+# Base toolchain (same as the backend build) plus desktop extras:
+# libsecret-devel for browser-secret, ImageMagick (EPEL) for icon conversion,
+# libxkbcommon-devel to link the rebuilt xa11y binding. EPEL installs last in
+# its own transaction: enabling it during the main solve shadows AppStream's
+# perl and breaks dependency resolution.
+RUN dnf install -y \
+  git python3.11 cmake make pkg-config perl clang-devel patch \
+  libsecret-devel libxkbcommon-devel \
+  gcc-toolset-13-gcc gcc-toolset-13-gcc-c++ gcc-toolset-13-libstdc++-devel \
+  && dnf clean all \
+  && rm -rf /var/cache/dnf \
+  && ln -sf /usr/bin/python3.11 /usr/local/bin/python3
+RUN dnf install -y epel-release \
+  && dnf install -y ImageMagick \
+  && dnf clean all \
+  && rm -rf /var/cache/dnf \
+  && (command -v magick || command -v convert)
+
+ENV PATH="/opt/rh/gcc-toolset-13/root/usr/bin:/usr/local/bin:/usr/bin:/bin" \
+  CC=/opt/rh/gcc-toolset-13/root/usr/bin/gcc \
+  CXX=/opt/rh/gcc-toolset-13/root/usr/bin/g++ \
+  npm_config_python=/usr/bin/python3.11
+
+# Two Rust toolchains (rustup shims honor RUSTUP_TOOLCHAIN per step):
+# - stable (default): resource-monitor and the capture helpers. t3's own
+#   crates track recent dependency MSRVs (sysinfo needs 1.95+) and link
+#   cleanly against glibc 2.28 (verified: max GLIBC_2.28).
+# - 1.90.0: the fff/xa11y rebuilds, whose dependency trees reference newer
+#   glibc symbols under recent toolchains. Pinned with pinned sources.
+ENV RUSTUP_HOME=/opt/rustup \
+  CARGO_HOME=/opt/cargo
+ENV PATH="/opt/cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh \
+  && sh /tmp/rustup.sh -y --profile minimal \
+  && rm /tmp/rustup.sh \
+  && rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal \
+  && rustc --version \
+  && rustup run "${RUST_TOOLCHAIN}" rustc --version
+
+# Zig (same version as fff's official release) for zlob's build-time compile.
+RUN curl -fsSLO "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+  && tar -xJf "zig-x86_64-linux-${ZIG_VERSION}.tar.xz" -C /opt \
+  && ln -sf "/opt/zig-x86_64-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig \
+  && rm "zig-x86_64-linux-${ZIG_VERSION}.tar.xz" \
+  && zig version
+
+RUN corepack enable \
+  && corepack prepare pnpm@11.10.0 --activate \
+  && pnpm --version
+
+WORKDIR /src
+COPY . .
+RUN pnpm install --frozen-lockfile
+
+# Rebuild the two natives whose published binaries cannot load on glibc 2.28.
+# Pinned to Rust 1.90: newer toolchains pull newer glibc symbols into them.
+RUN RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" packaging/rocky8/scripts/build-fff.sh --tag "${FFF_TAG}" --out /opt/native/libfff_c.so
+RUN RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" packaging/rocky8/scripts/build-xa11y.sh --tag "${XA11Y_TAG}" --out /opt/native/xa11y.linux-x64-gnu.node
+
+# Local vp on PATH: build-desktop-artifact shells `vp run build:desktop` for
+# the JS bundles and `vp install --prod` for the staged app.
+ENV PATH="/src/node_modules/.bin:${PATH}" \
+  T3CODE_DESKTOP_NATIVE_OVERRIDE_DIR=/opt/native
+RUN node scripts/build-desktop-artifact.ts --platform linux --target AppImage --arch x64 --output-dir /opt/t3desk
+RUN ls -la /opt/t3desk/*.AppImage
+
+# ---------------------------------------------------------------------------
+# Stage: tester — Rocky 8.10 + desktop runtime deps + Xvfb (no build tools).
+# ---------------------------------------------------------------------------
+FROM rockylinux/rockylinux:${ROCKY_VERSION} AS tester
+# Electron/Chromium runtime set (matches the verified probe) + Xvfb and
+# xwininfo for the headless GUI test + FUSE for direct AppImage execution +
+# libsecret (browser-secret helper links it; real Rocky desktops ship it).
+RUN dnf install -y \
+  gtk3 nss nspr libdrm mesa-libgbm alsa-lib at-spi2-atk \
+  libXcomposite libXdamage libXrandr libxkbcommon pango cairo cups-libs \
+  libX11 libXext libXfixes libxcb libsecret \
+  xorg-x11-server-Xvfb xorg-x11-utils fuse curl ca-certificates \
+  && dnf clean all \
+  && rm -rf /var/cache/dnf
+COPY --from=node-base /usr/local /usr/local
+COPY --from=builder /opt/t3desk/*.AppImage /opt/t3desk/
+
+# ---------------------------------------------------------------------------
+# Stage: selftest — extract the AppImage and exercise it (default target).
+# ---------------------------------------------------------------------------
+FROM tester AS selftest
+COPY packaging/rocky8/scripts/desktop-smoke.sh /tmp/desktop-smoke.sh
+RUN /tmp/desktop-smoke.sh
