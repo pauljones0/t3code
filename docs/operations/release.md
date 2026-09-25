@@ -203,16 +203,36 @@ A deleted legacy tunnel keeps its allocation, so its hostname is kept. When the 
 - On an older build linked from web or mobile, the host stays offline until T3 Code on that computer
   is updated.
 
+Ship the web and mobile builds that show the offline reason before enabling legacy cleanup, so a
+user whose host is affected sees what to do. The relay adds the `tunnel_released_at` allocation
+column in its first deploy with this change; the legacy switch stays `off` until you set it.
+
 1. Run `vp run --filter t3code-relay tunnels:census` with a read-only Cloudflare token. It counts
    tunnels in every relay stage. The reaper only sees its own stage's tunnels, so clean up the rest
    by hand.
 2. Set the legacy mode to `dry-run`, deploy, and read `wouldDeleteLegacy`, `legacyOver30Days`,
-   `totalDown`, and `totalInactive` on the sweep spans for a day.
+   `totalDown`, and `totalInactive` on the sweep spans for a day. `wouldDeleteLegacy` counts only the
+   tunnels a sweep inspected, at most 500 per status, so use `totalDown` and `totalInactive` for the
+   size of the backlog.
 3. Run the legacy steps of the disposable-host canary below.
 4. Set the legacy mode to `enabled`. One sweep deletes at most 100 tunnels, four at a time, and
    stops starting new deletions after 90 seconds. A backlog of 20,000 takes about 17 hours if each
    sweep finishes its 100. Watch `deletedLegacy`, `attempted`, `failed`, and `truncated`; an
    `attempted` well under 100 means sweeps are running out of time.
+
+In Axiom, filter the relay traces dataset on `name == "relay.managed_endpoint_reaper.sweep"` and
+chart the `attributes.custom.relay.managed_endpoint_reaper.*` fields over time.
+
+Set the legacy mode back to `off` and deploy if any of these happen:
+
+- `failed` stays above a few per sweep. Read the warning log for the Cloudflare error.
+- Users report an environment that is offline with the update message after they have updated T3
+  Code on that computer and restarted it.
+- Relay request errors rise while sweeps run. Deletions share the Postgres connection pool with
+  request handlers.
+
+Turning the switch off stops new deletions. Deleted tunnels stay deleted; their hosts recover as
+described above.
 
 ### Disposable-host canary
 
