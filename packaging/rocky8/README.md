@@ -37,8 +37,9 @@ docker build -f packaging/rocky8/Dockerfile --target runtime -t t3-rocky8:local 
 ```
 
 Build args (defaults in the Dockerfile): `ROCKY_VERSION=8.10`,
-`NODE_VERSION=24.21.0`, `RUST_TOOLCHAIN=1.90.0`, `ZIG_VERSION=0.16.0`,
-`FFF_TAG=v0.9.4`.
+`NODE_VERSION=24.21.0`, `RUST_TOOLCHAIN=1.90.0`, `ZIG_VERSION=0.16.0`.
+(The fff/xa11y rebuild tags derive from the repo's pinned dependency versions,
+so upstream bumps can never silently drift.)
 
 ## Run
 
@@ -156,13 +157,17 @@ chmod +x T3-Code-*-x64.AppImage
 (Root containers need `--no-sandbox`, a Chromium restriction unrelated to
 Rocky; regular desktop users run without it.)
 
-## Staying up to date (automated releases)
+## Staying up to date (daily auto-publish)
 
-Releases are built by CI. To ship a new backend, rebase the packaging onto the
-latest upstream and push a tag — the
+Releases publish themselves. Every day at 06:19 UTC the
 [`rocky8-backend-release`](../../.github/workflows/rocky8-backend-release.yml)
-workflow builds the image, runs the selftest, pushes to GHCR, and attaches the
-bare-metal tarball to the release. No local Docker needed.
+workflow rebases `rocky8-backend` onto upstream `pingdotgg/t3code` `main`; if
+upstream moved (or the branch HEAD was never released), it pushes the branch,
+builds backend + desktop with selftests, pushes the backend image to GHCR, and
+cuts a `rocky8-v<VERSION>-<YYYYMMDD>-<upstream-sha>` release with the tarball
+and AppImage. Quiet days do nothing. A red build creates no release, and a
+conflicted rebase fails before pushing anything (resolve on `rocky8-backend`
+and re-run).
 
 ```bash
 git fetch origin                        # upstream pingdotgg/t3code
@@ -177,15 +182,19 @@ Tag convention: `rocky8-v<VERSION>[-N]`, where `VERSION` matches
 version (packaging fixes, base-image refreshes). Watch the run under the fork's
 Actions tab; a red build creates no release.
 
-Published artifacts per tag:
+Published artifacts per release:
 
 - Backend image: `ghcr.io/pauljones0/t3code-rocky8:<tag>` (and `:latest`)
 - Backend tarball: `t3-rocky8-linux-x64.tar.gz` on the release page
 - Desktop AppImage: `T3-Code-*-x64.AppImage` on the release page
 
-To verify CI without cutting a release, use Actions → `rocky8-backend-release`
-→ Run workflow: it builds, self-tests, and uploads the tarball as a run
-artifact instead.
+Actions → `rocky8-backend-release` → Run workflow builds both artifacts
+without releasing (proves CI without side effects); tick `publish` to run the
+full daily flow on demand. Watch runs under the fork's Actions tab.
+
+Note: the fork's `main` stays `upstream main + this workflow file` (the daily
+job re-syncs it whenever it rebases). Dispatch and scheduled runs need the
+file there; tags run the file from the tagged commit.
 
 ## Files
 
