@@ -220,6 +220,7 @@ function makeAllocations(calls: AllocationCall[] = []) {
           origin: null,
           updatedAt: `generation-${++generation}`,
           generation: 0,
+          tunnelReleasedAt: null,
         };
         allocations.set(allocationKey(input), allocation);
         return allocation;
@@ -967,6 +968,11 @@ describe("ManagedEndpointProvider", () => {
         "updateRecord",
       ]);
       expect(allocationCalls.map((call) => call.operation)).not.toContain("remove");
+      // Only the claim taken right before the delete records the release.
+      const claims = allocationCalls.filter((call) => call.operation === "claimRelease");
+      expect(claims.map((call) => (call.input as { markReleased?: boolean }).markReleased)).toEqual(
+        [undefined, true],
+      );
     }).pipe(Effect.provide(layer));
   });
 
