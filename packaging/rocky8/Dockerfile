@@ -23,7 +23,6 @@ ARG ROCKY_VERSION=8.10
 ARG NODE_VERSION=24.21.0
 ARG RUST_TOOLCHAIN=1.90.0
 ARG ZIG_VERSION=0.16.0
-ARG FFF_TAG=v0.9.4
 
 # ---------------------------------------------------------------------------
 # Stage: node-base — Rocky 8.10 + upstream Node (shared by build and runtime).
@@ -49,7 +48,6 @@ RUN curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-
 FROM node-base AS build
 ARG RUST_TOOLCHAIN
 ARG ZIG_VERSION
-ARG FFF_TAG
 
 # git: fff source checkout. python3.11: node-gyp (Rocky default 3.6 too old).
 # gcc-toolset-13: C++20 compiler for node-pty against Node 24 headers.
@@ -106,8 +104,9 @@ RUN test -f apps/server/dist/bin.mjs && test -f apps/server/dist/client/index.ht
   && echo "server bundle + web client present"
 
 # Rebuild the one native library that cannot run on glibc 2.28, from the exact
-# tagged source matching the pinned @ff-labs/fff-node.
-RUN packaging/rocky8/scripts/build-fff.sh --tag "${FFF_TAG}" --out /opt/fff/libfff_c.so
+# tagged source matching the repo's pinned @ff-labs/fff-node. The tag is
+# derived from the pin (never hardcoded) so version bumps can't silently drift.
+RUN packaging/rocky8/scripts/build-fff.sh --tag "v$(node -p 'require("/src/apps/server/package.json").dependencies["@ff-labs/fff-node"]')" --out /opt/fff/libfff_c.so
 
 # Stage the runtime node_modules: only the native externals the bundle keeps
 # external (node-pty, fff-node, ffi-rs + platform bindings), with the rebuilt
@@ -132,6 +131,7 @@ RUN ln -sf /app/dist/bin.mjs /usr/local/bin/t3 \
   && chmod +x /app/dist/bin.mjs \
   && node --version \
   && node -e "require('/app/node_modules/node-pty');console.log('pty.node loads')" \
+  && node -e "require('/app/node_modules/@napi-rs/keyring');console.log('keyring loads')" \
   && ldd /app/node_modules/@ff-labs/fff-bin-linux-x64-gnu/libfff_c.so
 WORKDIR /app
 EXPOSE 3773

@@ -29,6 +29,9 @@ echo "cli ok"
 echo "== node-pty =="
 node -e "const p=require('node-pty');const t=p.spawn('echo',['pty-alive'],{});t.onData(d=>{process.stdout.write('pty says: '+d);t.kill();});setTimeout(()=>process.exit(0),3000);"
 
+echo "== keyring (import-only; secret I/O needs a D-Bus service) =="
+node -e "require('@napi-rs/keyring');console.log('keyring ok')"
+
 echo "== fff (rebuilt libfff_c.so via ffi-rs) =="
 mkdir -p /tmp/fff-smoke/src
 echo "hello rocky" > /tmp/fff-smoke/src/rocky-note.txt
