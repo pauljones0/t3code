@@ -1,5 +1,6 @@
 import * as NodeOS from "node:os";
 
+import { CODEX_THREAD_CONFIG } from "../src/orchestration-v2/Adapters/CodexAdapterV2.ts";
 import { revertCodexThread } from "../src/provider/CodexThreadRevert.ts";
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -119,8 +120,11 @@ interface ReplayRun {
   readonly steps: ReadonlyArray<ReplayStep>;
   readonly turnDefaults?: Omit<TurnStartParams, "input" | "threadId">;
   readonly interactionMode?: "plan";
-  /** Config overrides for `thread/start`; replay ignores them when matching frames. */
-  readonly threadConfig?: CodexSchema.V2ThreadStartParams["config"];
+  /**
+   * Recorder-only `thread/start` config merged over the adapter's. Its keys go in the
+   * transcript header as `recorderThreadConfigKeys`, which replay leaves out of matching.
+   */
+  readonly threadConfig?: Readonly<Record<string, boolean | number | string>>;
 }
 
 type ReplayStep =
@@ -585,8 +589,6 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
           name: "todo-list",
           description: "Default-mode turn that should surface turn/plan/updated notifications.",
           prompt: TODO_LIST_PROMPT,
-          // Codex 0.156 only registers update_plan when this is enabled.
-          threadConfig: { "tools.update_plan.enabled": true },
           turnDefaults: {
             approvalPolicy: "never",
             sandboxPolicy: readOnlyFullAccessSandbox(),
@@ -947,6 +949,11 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
   ];
 }
 
+function recorderThreadConfigMetadata(scenario: ReplayScenario) {
+  const keys = [...new Set(scenario.runs.flatMap((run) => Object.keys(run.threadConfig ?? {})))];
+  return keys.length === 0 ? {} : { recorderThreadConfigKeys: keys };
+}
+
 function makeRecorder({
   outPath,
   scenario,
@@ -992,6 +999,7 @@ function makeRecorder({
               fileName: scenario.fileName,
               description: scenario.description,
               model: scenarioModel(scenario),
+              ...recorderThreadConfigMetadata(scenario),
             },
           },
           ...outputRecords,
@@ -1209,7 +1217,7 @@ function runReplaySession({
       approvalGate ? Deferred.await(approvalGate) : Effect.void;
     const model = scenarioModel(scenario);
     // Same runtime params the adapter sends on thread/start, thread/resume and thread/fork.
-    const threadRuntimeParams = { cwd: process.cwd(), model };
+    const threadRuntimeParams = { cwd: process.cwd(), model, config: CODEX_THREAD_CONFIG };
     const lastTurnIdByThread = new Map<string, string>();
     const runningCommandProcessIds = new Map<string, Map<string, string>>();
 
@@ -1358,7 +1366,7 @@ function runReplaySession({
       const client = yield* initializeClient;
       const thread = yield* client.request("thread/start", {
         ...threadRuntimeParams,
-        ...(run.threadConfig === undefined ? {} : { config: run.threadConfig }),
+        config: { ...threadRuntimeParams.config, ...run.threadConfig },
       });
       let activeThreadId = thread.thread.id;
       const threadIds = new Map<string, string>([["source", thread.thread.id]]);
