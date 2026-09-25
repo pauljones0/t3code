@@ -56,7 +56,7 @@ export const OPENCODE_SUBAGENT_PROMPT =
 export const SUBAGENT_CONTINUE_PROMPT =
   "Spawn one subagent and have it reply exactly: initial subagent response";
 export const SUBAGENT_CONTINUE_PARENT_PROMPT =
-  "@hooke have the same subagent reply exactly: continued subagent response";
+  "Have the same subagent you spawned earlier reply exactly: continued subagent response";
 export const SUBAGENT_CONTINUE_CHILD_PROMPT = "Reply exactly: continued subagent response";
 export const TURN_INTERRUPT_PROMPT =
   "Do not answer immediately. First run the local shell command `sleep 30`, then respond with exactly: interrupt fixture should not finish naturally.";
@@ -294,7 +294,7 @@ export interface FixtureIds {
 
 export const CODEX_MODEL_SELECTION = {
   instanceId: ProviderInstanceId.make("codex"),
-  model: "gpt-5.4",
+  model: "gpt-6-luna",
 } satisfies ModelSelection;
 
 export const CLAUDE_MODEL_SELECTION = {

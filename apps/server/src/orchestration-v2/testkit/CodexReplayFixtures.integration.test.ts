@@ -128,13 +128,7 @@ const scenarioExpectations = {
   },
   tool_call_restricted_granular: {
     outgoing: ["initialize", "initialized", "thread/start", "turn/start"],
-    incoming: [
-      "item/fileChange/requestApproval",
-      "serverRequest/resolved",
-      "item/fileChange/outputDelta",
-      "turn/diff/updated",
-      "turn/completed",
-    ],
+    incoming: ["item/fileChange/requestApproval", "serverRequest/resolved", "turn/completed"],
     turnStartCount: 1,
     turnCompletedCount: 1,
     approvalRequestCount: 1,
@@ -147,23 +141,10 @@ const scenarioExpectations = {
     approvalRequestCount: 0,
   },
   subagent_continue: {
-    outgoing: [
-      "initialize",
-      "initialized",
-      "thread/start",
-      "turn/start/spawn",
-      "turn/start/continue",
-    ],
-    incoming: [
-      "turn/started/root-1",
-      "turn/completed/child-1",
-      "turn/completed/root-1",
-      "turn/started/root-2",
-      "turn/completed/child-2",
-      "turn/completed/root-2",
-    ],
-    turnStartCount: 0,
-    turnCompletedCount: 0,
+    outgoing: ["initialize", "initialized", "thread/start", "turn/start"],
+    incoming: ["turn/started", "item/completed", "turn/completed"],
+    turnStartCount: 2,
+    turnCompletedCount: 4,
     approvalRequestCount: 0,
   },
   subagent_v2: {
@@ -208,7 +189,7 @@ const scenarioExpectations = {
   },
   proposed_plan: {
     outgoing: ["initialize", "initialized", "thread/start", "turn/start"],
-    incoming: ["turn/started", "turn/completed", "item/agentMessage/delta"],
+    incoming: ["turn/started", "turn/completed", "item/plan/delta"],
     turnStartCount: 1,
     turnCompletedCount: 1,
     approvalRequestCount: 0,
@@ -450,9 +431,9 @@ function assertProviderThreadResumeSemantics(transcript: ProviderReplayTranscrip
     findProtocolEntry(transcript, "expect_outbound", "thread/resume").frame,
     ["params", "threadId"],
   );
+  const resumeRequest = findProtocolEntry(transcript, "expect_outbound", "thread/resume").frame;
   const resumedThreadFrame = findProtocolEntry(transcript, "emit_inbound", "thread/resume").frame;
   const resumedThreadId = readString(resumedThreadFrame, ["result", "thread", "id"]);
-  const resumedTurns = readArray(resumedThreadFrame, ["result", "thread", "turns"]);
   const secondTurnThreadId = readString(
     findProtocolEntry(transcript, "expect_outbound", "turn/start", 1).frame,
     ["params", "threadId"],
@@ -475,20 +456,10 @@ function assertProviderThreadResumeSemantics(transcript: ProviderReplayTranscrip
     startThreadId,
     "turn after resume must run on the resumed provider thread",
   );
-  assert.isAtLeast(resumedTurns.length, 1, "thread/resume response must include prior turns");
-
-  const resumedFirstTurnItems = readArray(resumedTurns[0], ["items"]);
-  const resumedFirstTurnAgentText = resumedFirstTurnItems
-    .filter(isRecord)
-    .filter((item) => item.type === "agentMessage")
-    .map((item) => item.text)
-    .find((text): text is string => typeof text === "string");
-
-  assert.equal(
-    resumedFirstTurnAgentText,
-    PROVIDER_THREAD_RESUME_FIRST_FINAL,
-    "thread/resume response must hydrate the prior assistant answer",
-  );
+  // The adapter resumes with excludeTurns, so history reaches the model, not the response.
+  assert.equal(readPath(resumeRequest, ["params", "excludeTurns"]), true);
+  assert.lengthOf(readArray(resumedThreadFrame, ["result", "thread", "turns"]), 0);
+  assert.equal(texts[0], PROVIDER_THREAD_RESUME_FIRST_FINAL);
   assert.include(
     secondFinalText,
     PROVIDER_THREAD_RESUME_FIRST_FINAL,

@@ -1,3 +1,5 @@
+import * as NodeOS from "node:os";
+
 import { revertCodexThread } from "../src/provider/CodexThreadRevert.ts";
 import * as NodeRuntime from "@effect/platform-node/NodeRuntime";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -53,6 +55,7 @@ import {
   TOOL_CALL_WRITE_PROMPT,
   TURN_INTERRUPT_MID_TOOL_PROMPT,
   TURN_INTERRUPT_PROMPT,
+  WEB_SEARCH_PROMPT,
 } from "../src/orchestration-v2/testkit/fixtures/shared.ts";
 import { codexReplayRecordingOutputRecords } from "./codexReplayRecordingRecords.ts";
 import { makeReplayRecorderDeferredRegistry } from "./replayRecorderDeferredRegistry.ts";
@@ -65,14 +68,14 @@ const CODEX_CLIENT_INFO = {
   title: "T3 Code Desktop",
   version: "0.1.0",
 } as const;
-// Match the V2 adapter's initialize and turn/start frames so recordings replay
+// Match the V2 adapter's initialize, thread and turn frames so recordings replay
 // against it without hand edits.
 const CODEX_CLIENT_CAPABILITIES = {
   experimentalApi: true,
   optOutNotificationMethods: ["turn/diff/updated"],
 } as const;
-const CODEX_REPLAY_MODEL =
-  readArgValue("--model") ?? process.env.T3_CODEX_REPLAY_MODEL ?? "gpt-5.4";
+const CODEX_REPLAY_DEFAULT_MODEL = "gpt-6-luna";
+const CODEX_REPLAY_MODEL_OVERRIDE = readArgValue("--model") ?? process.env.T3_CODEX_REPLAY_MODEL;
 
 const SCENARIO_NAMES = [
   "simple",
@@ -84,8 +87,10 @@ const SCENARIO_NAMES = [
   "subagent_v2",
   "subagent_v2_nested",
   "multi_turn",
+  "queued_turn",
   "provider_thread_resume",
   "todo_list",
+  "web_search",
   "plan_questions",
   "proposed_plan",
   "message_steering",
@@ -113,6 +118,7 @@ interface ReplayRun {
   readonly description: string;
   readonly steps: ReadonlyArray<ReplayStep>;
   readonly turnDefaults?: Omit<TurnStartParams, "input" | "threadId">;
+  readonly interactionMode?: "plan";
   /** Config overrides for `thread/start`; replay ignores them when matching frames. */
   readonly threadConfig?: CodexSchema.V2ThreadStartParams["config"];
 }
@@ -160,6 +166,8 @@ interface ReplayScenario {
   readonly name: ScenarioName;
   readonly fileName: `${ScenarioName}.ndjson`;
   readonly description: string;
+  /** Model this scenario needs, e.g. one that still runs multi-agent v1. `--model` wins. */
+  readonly model?: string;
   readonly runs: ReadonlyArray<ReplayRun>;
 }
 
@@ -324,14 +332,16 @@ function granularApprovalPolicy(): ApprovalPolicy {
   };
 }
 
-function collaborationMode(
-  mode: Extract<CodexSchema.V2TurnStartParams__ModeKind, "plan">,
-): CodexSchema.V2TurnStartParams__CollaborationMode {
+function scenarioModel(scenario: ReplayScenario): string {
+  return CODEX_REPLAY_MODEL_OVERRIDE ?? scenario.model ?? CODEX_REPLAY_DEFAULT_MODEL;
+}
+
+function planCollaborationMode(model: string): CodexSchema.V2TurnStartParams__CollaborationMode {
   return {
-    mode,
+    mode: "plan",
     settings: {
       developer_instructions: CODEX_REPLAY_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
-      model: "gpt-5.4",
+      model,
       reasoning_effort: "medium",
     },
   };
@@ -357,6 +367,8 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
       fileName: "tool_call_read_only_on_request.ndjson",
       description:
         "Write a small fixture file with read-only full filesystem visibility and on-request approvals.",
+      // gpt-6-luna declines to attempt the write under a read-only sandbox; gpt-6-sol tries it.
+      model: "gpt-6-sol",
       runs: [
         {
           name: "read-only-on-request",
@@ -395,6 +407,9 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
       fileName: "tool_call_restricted_granular.ndjson",
       description:
         "Write a small fixture file with restricted read access and granular approval flags enabled.",
+      // gpt-6 models write through the shell; gpt-5.6-terra uses apply_patch, which is what
+      // raises the file-change approval this scenario covers.
+      model: "gpt-5.6-terra",
       runs: [
         {
           name: "restricted-granular",
@@ -419,11 +434,15 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
       name: "subagent",
       fileName: "subagent.ndjson",
       description: "One root turn that asks Codex to spawn two collab agents.",
+      // gpt-5.6-luna still runs multi-agent v1, the only live source of collabAgentToolCall.
+      model: "gpt-5.6-luna",
       runs: [
         {
           name: "two-subagents",
           description: "Root turn asks for two subagents reading different files.",
           prompt: SUBAGENT_PROMPT,
+          // Without this, children read the recording user's own skills into the fixture.
+          threadConfig: { "skills.include_instructions": false },
           turnDefaults: {
             approvalPolicy: "on-request",
             sandboxPolicy: readOnlyFullAccessSandbox(),
@@ -441,7 +460,7 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
         {
           name: "spawn-v2-subagent",
           description:
-            "Record with a v2 model (e.g. --model gpt-5.6-sol) so Codex emits subAgentActivity items.",
+            "The default model runs multi-agent v2, so Codex emits subAgentActivity items.",
           steps: [{ type: "turn", label: "spawn-v2-subagent", prompt: SUBAGENT_V2_PROMPT }],
         },
       ],
@@ -454,8 +473,7 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
       runs: [
         {
           name: "spawn-nested-v2-subagents",
-          description:
-            "Record with a v2 model (e.g. --model gpt-5.6-sol); depth 3 lets each child spawn again.",
+          description: "Multi-agent v2; depth 3 lets each child spawn again.",
           threadConfig: { "agents.max_depth": 3 },
           steps: [
             {
@@ -472,6 +490,8 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
       fileName: "subagent_continue.ndjson",
       description:
         "A root turn spawns one native Codex subagent, then a later root turn resumes and messages the same child thread.",
+      // gpt-5.6-luna still runs multi-agent v1, the only live source of collabAgentToolCall.
+      model: "gpt-5.6-luna",
       runs: [
         {
           name: "continued-subagent",
@@ -516,6 +536,22 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
       ],
     },
     {
+      name: "queued_turn",
+      fileName: "queued_turn.ndjson",
+      description: "A second user turn queued behind an active turn starts after it completes.",
+      runs: [
+        {
+          name: "queued-second-turn",
+          description:
+            "The orchestrator holds the queued message until the first turn completes, so the provider sees two sequential turns.",
+          steps: [
+            { type: "turn", label: "first", prompt: MULTI_TURN_FIRST_PROMPT },
+            { type: "turn", label: "queued", prompt: MULTI_TURN_SECOND_PROMPT },
+          ],
+        },
+      ],
+    },
+    {
       name: "provider_thread_resume",
       fileName: "provider_thread_resume.ndjson",
       description:
@@ -549,11 +585,26 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
           name: "todo-list",
           description: "Default-mode turn that should surface turn/plan/updated notifications.",
           prompt: TODO_LIST_PROMPT,
+          // Codex 0.156 only registers update_plan when this is enabled.
+          threadConfig: { "tools.update_plan.enabled": true },
           turnDefaults: {
             approvalPolicy: "never",
             sandboxPolicy: readOnlyFullAccessSandbox(),
           },
           steps: [{ type: "turn", label: "todo-list", prompt: TODO_LIST_PROMPT }],
+        },
+      ],
+    },
+    {
+      name: "web_search",
+      fileName: "web_search.ndjson",
+      description:
+        "One turn with a native Codex webSearch item that should become normalized progress.",
+      runs: [
+        {
+          name: "web-search",
+          description: "Default-mode turn that should surface a webSearch item.",
+          steps: [{ type: "turn", label: "web-search", prompt: WEB_SEARCH_PROMPT }],
         },
       ],
     },
@@ -566,9 +617,9 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
           name: "plan-questions",
           description: "Plan-mode turn intended to surface item/tool/requestUserInput.",
           prompt: PLAN_QUESTIONS_PROMPT,
+          interactionMode: "plan",
           turnDefaults: {
             approvalPolicy: "never",
-            collaborationMode: collaborationMode("plan"),
             sandboxPolicy: readOnlyFullAccessSandbox(),
           },
           steps: [{ type: "turn", label: "plan-questions", prompt: PLAN_QUESTIONS_PROMPT }],
@@ -585,9 +636,9 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
           description:
             "Plan-mode turn intended to surface item/plan/delta and completed plan item.",
           prompt: PROPOSED_PLAN_PROMPT,
+          interactionMode: "plan",
           turnDefaults: {
             approvalPolicy: "never",
-            collaborationMode: collaborationMode("plan"),
             sandboxPolicy: readOnlyFullAccessSandbox(),
           },
           steps: [{ type: "turn", label: "proposed-plan", prompt: PROPOSED_PLAN_PROMPT }],
@@ -736,6 +787,9 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
       fileName: "thread_fork_native_siblings.ndjson",
       description:
         "One source marker turn and two independent native forks that each recall the source plus only their own fork marker.",
+      // gpt-6-luna often answers the recall turn with an earlier acknowledgement instead of
+      // the markers; gpt-6-sol recalls them.
+      model: "gpt-6-sol",
       runs: [
         {
           name: "native-sibling-forks",
@@ -781,6 +835,9 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
       fileName: "thread_merge_back_continue.ndjson",
       description:
         "A source thread consumes one fork-delta handoff and later recalls source and transferred context.",
+      // gpt-6-luna often answers the recall turn with an earlier acknowledgement instead of
+      // the markers; gpt-6-sol recalls them.
+      model: "gpt-6-sol",
       runs: [
         {
           name: "merge-native-fork",
@@ -826,6 +883,9 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
       fileName: "thread_merge_back_siblings.ndjson",
       description:
         "Two sibling fork deltas are merged sequentially into one source provider thread and recalled together.",
+      // gpt-6-luna often answers the recall turn with an earlier acknowledgement instead of
+      // the markers; gpt-6-sol recalls them.
+      model: "gpt-6-sol",
       runs: [
         {
           name: "merge-native-sibling-forks",
@@ -890,9 +950,12 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
 function makeRecorder({
   outPath,
   scenario,
+  checkout,
 }: {
   readonly outPath: string;
   readonly scenario: ReplayScenario;
+  /** Checkout root, scrubbed from recordings because it names the local worktree layout. */
+  readonly checkout: string;
 }): Effect.Effect<Recorder, PlatformError.PlatformError, FileSystem.FileSystem> {
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -909,6 +972,11 @@ function makeRecorder({
     const flush = () => {
       const outputRecords = codexReplayRecordingOutputRecords(records, {
         workspace: process.cwd(),
+        machine: {
+          home: NodeOS.homedir(),
+          hostname: NodeOS.hostname(),
+          checkout,
+        },
       });
       return fs.writeFileString(
         outPath,
@@ -923,7 +991,7 @@ function makeRecorder({
               source: "record-codex-app-server-replay-fixture",
               fileName: scenario.fileName,
               description: scenario.description,
-              model: CODEX_REPLAY_MODEL,
+              model: scenarioModel(scenario),
             },
           },
           ...outputRecords,
@@ -1000,7 +1068,9 @@ function makeCodexLayer({ recorder }: { readonly recorder: Recorder }) {
   return Layer.effect(
     CodexClient.CodexAppServerClient,
     Effect.gen(function* () {
-      const environment = yield* HostProcessEnvironment;
+      // The vp node shim marks its children with VP_TOOL_RECURSION, which makes every
+      // `node` the agent runs through a shell fail. Codex must not inherit it.
+      const { VP_TOOL_RECURSION: _vpToolRecursion, ...environment } = yield* HostProcessEnvironment;
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const commandName = environment.T3_CODEX_BIN ?? environment.CODEX_BIN ?? "codex";
       const spawnCommand = yield* resolveSpawnCommand(commandName, ["app-server"], {
@@ -1025,12 +1095,15 @@ function installReplayHandlers({
   completeTurn,
   startCommandExecution,
   beforeApprovalResponse,
+  runningCommandProcessIds,
 }: {
   readonly client: CodexClient.CodexAppServerClient["Service"];
   readonly startTurn: (turnId: string) => Effect.Effect<void>;
   readonly completeTurn: (turnId: string) => Effect.Effect<void>;
   readonly startCommandExecution: (turnId: string) => Effect.Effect<void>;
   readonly beforeApprovalResponse: () => Effect.Effect<void>;
+  /** Turn id -> command item id -> process id, for commands still running. */
+  readonly runningCommandProcessIds: Map<string, Map<string, string>>;
 }) {
   return Effect.all(
     [
@@ -1092,16 +1165,21 @@ function installReplayHandlers({
       client.handleServerNotification("turn/completed", (payload) =>
         completeTurn(payload.turn.id).pipe(Effect.ignore),
       ),
-      client.handleServerNotification("item/completed", (payload) =>
-        isRecord(payload.item) && payload.item.type === "commandExecution"
-          ? startCommandExecution(payload.turnId).pipe(Effect.ignore)
-          : Effect.void,
-      ),
-      client.handleServerNotification("item/started", (payload) =>
-        isRecord(payload.item) && payload.item.type === "commandExecution"
-          ? startCommandExecution(payload.turnId).pipe(Effect.ignore)
-          : Effect.void,
-      ),
+      client.handleServerNotification("item/completed", (payload) => {
+        if (payload.item.type !== "commandExecution") return Effect.void;
+        runningCommandProcessIds.get(payload.turnId)?.delete(payload.item.id);
+        return startCommandExecution(payload.turnId).pipe(Effect.ignore);
+      }),
+      client.handleServerNotification("item/started", (payload) => {
+        if (payload.item.type !== "commandExecution") return Effect.void;
+        const processId = payload.item.processId;
+        if (payload.item.status === "inProgress" && typeof processId === "string") {
+          const running = runningCommandProcessIds.get(payload.turnId) ?? new Map();
+          running.set(payload.item.id, processId);
+          runningCommandProcessIds.set(payload.turnId, running);
+        }
+        return startCommandExecution(payload.turnId).pipe(Effect.ignore);
+      }),
     ],
     { discard: true },
   );
@@ -1129,6 +1207,11 @@ function runReplaySession({
     const startCommandExecution = startedCommandExecutions.succeed;
     const beforeApprovalResponse = () =>
       approvalGate ? Deferred.await(approvalGate) : Effect.void;
+    const model = scenarioModel(scenario);
+    // Same runtime params the adapter sends on thread/start, thread/resume and thread/fork.
+    const threadRuntimeParams = { cwd: process.cwd(), model };
+    const lastTurnIdByThread = new Map<string, string>();
+    const runningCommandProcessIds = new Map<string, Map<string, string>>();
 
     const initializeClient = Effect.gen(function* () {
       const client = yield* CodexClient.CodexAppServerClient;
@@ -1139,6 +1222,7 @@ function runReplaySession({
         completeTurn,
         startCommandExecution,
         beforeApprovalResponse,
+        runningCommandProcessIds,
       });
 
       yield* client.request("initialize", {
@@ -1161,9 +1245,12 @@ function runReplaySession({
           approvalPolicy: "never",
           sandboxPolicy: { type: "dangerFullAccess" },
           cwd: process.cwd(),
-          model: CODEX_REPLAY_MODEL,
+          model,
           summary: "detailed",
           approvalsReviewer: "user",
+          ...(run.interactionMode === "plan"
+            ? { collaborationMode: planCollaborationMode(model) }
+            : {}),
           ...run.turnDefaults,
           ...step.turnOverrides,
           input: turnInput(step.prompt),
@@ -1203,10 +1290,18 @@ function runReplaySession({
             threadId,
             turnId,
           });
+          // Like the adapter, stop commands the interrupt left running.
+          for (const processId of runningCommandProcessIds.get(turnId)?.values() ?? []) {
+            yield* client.raw.request("thread/backgroundTerminals/terminate", {
+              threadId,
+              processId,
+            });
+          }
         }
 
         const completed = yield* getCompletion(turnId);
         yield* Deferred.await(completed);
+        lastTurnIdByThread.set(threadId, turnId);
       });
 
     if (scenario.name === "provider_thread_resume") {
@@ -1225,7 +1320,7 @@ function runReplaySession({
 
       const firstThread = yield* Effect.gen(function* () {
         const client = yield* initializeClient;
-        const thread = yield* client.request("thread/start", {});
+        const thread = yield* client.request("thread/start", threadRuntimeParams);
         yield* runTurnStep(client, thread.thread.id, firstStep);
         return thread;
       }).pipe(
@@ -1245,6 +1340,8 @@ function runReplaySession({
         const client = yield* initializeClient;
         const thread = yield* client.request("thread/resume", {
           threadId: firstThread.thread.id,
+          excludeTurns: true,
+          ...threadRuntimeParams,
         });
         yield* runTurnStep(client, thread.thread.id, secondStep);
       }).pipe(
@@ -1259,10 +1356,10 @@ function runReplaySession({
 
     yield* Effect.gen(function* () {
       const client = yield* initializeClient;
-      const thread = yield* client.request(
-        "thread/start",
-        run.threadConfig === undefined ? {} : { config: run.threadConfig },
-      );
+      const thread = yield* client.request("thread/start", {
+        ...threadRuntimeParams,
+        ...(run.threadConfig === undefined ? {} : { config: run.threadConfig }),
+      });
       let activeThreadId = thread.thread.id;
       const threadIds = new Map<string, string>([["source", thread.thread.id]]);
 
@@ -1279,8 +1376,12 @@ function runReplaySession({
           if (sourceThreadId === undefined) {
             throw new Error(`Unknown replay thread alias '${step.from}'.`);
           }
+          // The adapter forks at the source's latest native turn.
+          const lastTurnId = lastTurnIdByThread.get(sourceThreadId);
           const forked = yield* client.request("thread/fork", {
             threadId: sourceThreadId,
+            ...(lastTurnId === undefined ? {} : { lastTurnId }),
+            ...threadRuntimeParams,
           });
           activeThreadId = forked.thread.id;
           if (step.as !== undefined) {
@@ -1318,7 +1419,8 @@ function runScenario({
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const recorder = yield* makeRecorder({ outPath, scenario });
+    const checkout = path.resolve(yield* path.fromFileUrl(new URL("../../..", import.meta.url)));
+    const recorder = yield* makeRecorder({ outPath, scenario, checkout });
 
     yield* fs.makeDirectory(path.dirname(outPath), { recursive: true });
     yield* Console.log(`Writing ${scenario.name} Codex replay events to ${recorder.path}`);
