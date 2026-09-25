@@ -103,6 +103,36 @@ export LD_LIBRARY_PATH=/opt/rh/gcc-toolset-13/root/usr/lib64
 A prebuilt `t3-rocky8-linux-x64.tar.gz` may also be attached to the fork's
 GitHub releases (see below).
 
+## Staying up to date (automated releases)
+
+Releases are built by CI. To ship a new backend, rebase the packaging onto the
+latest upstream and push a tag — the
+[`rocky8-backend-release`](../../.github/workflows/rocky8-backend-release.yml)
+workflow builds the image, runs the selftest, pushes to GHCR, and attaches the
+bare-metal tarball to the release. No local Docker needed.
+
+```bash
+git fetch origin                        # upstream pingdotgg/t3code
+git checkout rocky8-backend
+git rebase origin/main                  # our commit is packaging-only; usually clean
+git push fork rocky8-backend --force-with-lease
+git tag rocky8-v0.0.43 && git push fork rocky8-v0.0.43
+```
+
+Tag convention: `rocky8-v<VERSION>[-N]`, where `VERSION` matches
+`apps/server/package.json` and `-N` disambiguates rebuilds of the same backend
+version (packaging fixes, base-image refreshes). Watch the run under the fork's
+Actions tab; a red build creates no release.
+
+Published artifacts per tag:
+
+- Image: `ghcr.io/pauljones0/t3code-rocky8:<tag>` (and `:latest`)
+- Tarball: `t3-rocky8-linux-x64.tar.gz` on the release page
+
+To verify CI without cutting a release, use Actions → `rocky8-backend-release`
+→ Run workflow: it builds, self-tests, and uploads the tarball as a run
+artifact instead.
+
 ## Files
 
 - `Dockerfile` — multi-stage `rockylinux:8.10` build (`node-base`, `build`,
@@ -113,6 +143,8 @@ GitHub releases (see below).
   the lockfile-pinned versions, applies the repo's `fff-node` patch (the
   `require` export the server loader needs), and swaps in the rebuilt `.so`.
 - `scripts/smoke-test.sh` — acceptance check (also the `selftest` stage).
+- `.github/workflows/rocky8-backend-release.yml` — tag-driven CI: build,
+  selftest, GHCR push, release tarball.
 
 ## Source / fork
 
