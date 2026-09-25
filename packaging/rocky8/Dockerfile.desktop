@@ -27,8 +27,6 @@ ARG ROCKY_VERSION=8.10
 ARG NODE_VERSION=24.21.0
 ARG RUST_TOOLCHAIN=1.90.0
 ARG ZIG_VERSION=0.16.0
-ARG FFF_TAG=v0.9.4
-ARG XA11Y_TAG=v0.13.0
 
 # ---------------------------------------------------------------------------
 # Stage: node-base — Rocky 8.10 + upstream Node (shared by builder + tester).
@@ -49,8 +47,6 @@ RUN curl -fsSLO "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-
 FROM node-base AS builder
 ARG RUST_TOOLCHAIN
 ARG ZIG_VERSION
-ARG FFF_TAG
-ARG XA11Y_TAG
 
 # Base toolchain (same as the backend build) plus desktop extras:
 # libsecret-devel for browser-secret, ImageMagick (EPEL) for icon conversion,
@@ -108,8 +104,9 @@ RUN pnpm install --frozen-lockfile
 
 # Rebuild the two natives whose published binaries cannot load on glibc 2.28.
 # Pinned to Rust 1.90: newer toolchains pull newer glibc symbols into them.
-RUN RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" packaging/rocky8/scripts/build-fff.sh --tag "${FFF_TAG}" --out /opt/native/libfff_c.so
-RUN RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" packaging/rocky8/scripts/build-xa11y.sh --tag "${XA11Y_TAG}" --out /opt/native/xa11y.linux-x64-gnu.node
+# Tags derive from the repo pins (never hardcoded) so bumps can't silently drift.
+RUN RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" packaging/rocky8/scripts/build-fff.sh --tag "v$(node -p 'require("/src/apps/server/package.json").dependencies["@ff-labs/fff-node"]')" --out /opt/native/libfff_c.so
+RUN RUSTUP_TOOLCHAIN="${RUST_TOOLCHAIN}" packaging/rocky8/scripts/build-xa11y.sh --tag "v$(node -p 'require("/src/apps/desktop/package.json").dependencies["@crowecawcaw/xa11y"]')" --out /opt/native/xa11y.linux-x64-gnu.node
 
 # Local vp on PATH: build-desktop-artifact shells `vp run build:desktop` for
 # the JS bundles and `vp install --prod` for the staged app.

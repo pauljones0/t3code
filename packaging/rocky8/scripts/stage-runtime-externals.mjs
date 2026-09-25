@@ -3,9 +3,9 @@
 //
 // The server bundle (dist/bin.mjs) inlines everything EXCEPT the native
 // packages it must load from disk (see scripts/lib/cli-external-packages.ts):
-// node-pty and @ff-labs/fff-node (+ their transitive deps: ffi-rs and the
-// @yuuang napi binding). This script installs exactly those into a clean,
-// hoisted node_modules tree and swaps in the Rocky-compatible libfff_c.so.
+// node-pty, @ff-labs/fff-node, and @napi-rs/keyring (+ transitive deps: ffi-rs
+// and the napi platform bindings). This script installs exactly those into a
+// clean, hoisted node_modules tree and swaps in the Rocky-compatible libfff_c.so.
 //
 // Versions are read from the workspace install (frozen lockfile), so the
 // stage always matches the build. node-pty compiles here with the container
@@ -74,6 +74,8 @@ const versions = {
   ),
   // fff-node wants ffi-rs ^1.0.0; pin the locked version instead of latest.
   "ffi-rs": installedVersion(fffRequire, "ffi-rs"),
+  // Server-kept-external since CursorDriver stores credentials in it.
+  "@napi-rs/keyring": installedVersion(serverRequire, "@napi-rs/keyring"),
 };
 console.log("staging runtime externals at locked versions:", JSON.stringify(versions, null, 2));
 
@@ -136,6 +138,10 @@ console.log("node-pty loads from staged tree");
 // library itself opens lazily on FileFinder.create.
 createRequire(join(nm, "probe.cjs"))("@ff-labs/fff-node");
 console.log("fff-node loads via require() from staged tree");
+// Import-only: the napi binding must dlopen; actual secret I/O needs a
+// D-Bus secret service, which builders don't have.
+createRequire(join(nm, "probe.cjs"))("@napi-rs/keyring");
+console.log("keyring loads via require() from staged tree");
 
 execFileSync("ldd", [stockSo], { stdio: "inherit" });
 console.log(`staged runtime externals in ${nm}`);
