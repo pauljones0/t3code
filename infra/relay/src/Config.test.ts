@@ -56,16 +56,24 @@ it.effect("rejects an invalid cleanup mode binding", () =>
   }),
 );
 
-it.effect("declares the cleanup mode as a plain env binding", () =>
+it.effect("declares both cleanup modes as plain env bindings", () =>
   Effect.gen(function* () {
     const env = yield* managedEndpointCleanupModeEnv.pipe(
       Effect.provideService(
         ConfigProvider.ConfigProvider,
-        ConfigProvider.fromEnv({ env: { RELAY_TUNNEL_CLEANUP_MODE: "dry-run" } }),
+        ConfigProvider.fromEnv({
+          env: {
+            RELAY_TUNNEL_CLEANUP_MODE: "dry-run",
+            RELAY_LEGACY_TUNNEL_CLEANUP_MODE: "enabled",
+          },
+        }),
       ),
     );
     // A plain string is what Alchemy lowers into a `plain_text` binding that
     // its Worker diff compares; a Redacted or Config value would not change it.
-    expect(env).toEqual({ RELAY_TUNNEL_CLEANUP_MODE: "dry-run" });
+    expect(env).toEqual({
+      RELAY_TUNNEL_CLEANUP_MODE: "dry-run",
+      RELAY_LEGACY_TUNNEL_CLEANUP_MODE: "enabled",
+    });
   }),
 );
