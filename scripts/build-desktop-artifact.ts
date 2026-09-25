@@ -3344,6 +3344,76 @@ export const validateWindowsPackagedPayload = Effect.fn(
   return { packagedAppDir, fileCount, unpackedFiles } as const;
 });
 
+/**
+ * Fork addition (rocky8): swap staged native binaries for rebuilt ones.
+ *
+ * When T3CODE_DESKTOP_NATIVE_OVERRIDE_DIR points at a directory, every file
+ * in it replaces same-basename files found anywhere under the staged
+ * node_modules. The Rocky 8.10 build uses this for natives whose published
+ * binaries require a newer glibc than 2.28 (libfff_c.so, xa11y .node),
+ * rebuilt from the exact tagged sources. Unset = no-op, stock behavior.
+ */
+export const applyStagedNativeBinaryOverrides = Effect.fn("applyStagedNativeBinaryOverrides")(
+  function* (input: { readonly stageAppDir: string }) {
+    const overrideDir = yield* Config.String("T3CODE_DESKTOP_NATIVE_OVERRIDE_DIR").pipe(
+      Config.option,
+    );
+    if (Option.isNone(overrideDir)) return;
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const dir = overrideDir.value;
+    const entries = yield* fs.readDirectory(dir);
+    const replacements: string[] = [];
+    for (const entry of entries) {
+      const info = yield* fs.stat(path.join(dir, entry)).pipe(Effect.option);
+      if (Option.isSome(info) && info.value.type === "File") replacements.push(entry);
+    }
+    if (replacements.length === 0) {
+      yield* Effect.log(
+        `[desktop-artifact] Native override dir ${dir} holds no files; nothing to swap.`,
+      );
+      return;
+    }
+    const nodeModulesRoot = path.join(input.stageAppDir, "node_modules");
+    const findByBasename = (
+      root: string,
+      base: string,
+    ): Effect.Effect<ReadonlyArray<string>, PlatformError> =>
+      Effect.gen(function* () {
+        const children = yield* fs
+          .readDirectory(root)
+          .pipe(Effect.orElseSucceed((): ReadonlyArray<string> => []));
+        const hits: string[] = [];
+        for (const entry of children) {
+          const child = path.join(root, entry);
+          if (entry === base) {
+            hits.push(child);
+            continue;
+          }
+          const info = yield* fs.stat(child).pipe(Effect.option);
+          if (Option.isSome(info) && info.value.type === "Directory") {
+            hits.push(...(yield* findByBasename(child, base)));
+          }
+        }
+        return hits;
+      });
+    for (const base of replacements) {
+      const source = path.join(dir, base);
+      const targets = yield* findByBasename(nodeModulesRoot, base);
+      if (targets.length === 0) {
+        yield* Effect.logWarning(
+          `[desktop-artifact] Native override ${base} matched nothing under staged node_modules.`,
+        );
+        continue;
+      }
+      for (const target of targets) {
+        yield* fs.copyFile(source, target);
+        yield* Effect.log(`[desktop-artifact] Native override: ${target} <- ${source}`);
+      }
+    }
+  },
+);
+
 const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   options: ResolvedBuildOptions,
 ) {
@@ -3723,6 +3793,8 @@ const buildDesktopArtifact = Effect.fn("buildDesktopArtifact")(function* (
   );
   yield* stageClerkPasskeyNativeBinaries(stageAppDir, options.platform, options.arch);
   yield* stageKeyringNativeBinaries(stageAppDir, options.platform, options.arch);
+  // Fork addition (rocky8): no-op unless T3CODE_DESKTOP_NATIVE_OVERRIDE_DIR is set.
+  yield* applyStagedNativeBinaryOverrides({ stageAppDir });
 
   // Only the Windows artifact carries the server sidecar and the WSL runtime;
   // other platforms ignore the --wsl-runtime input.
