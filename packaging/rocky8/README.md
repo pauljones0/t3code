@@ -100,8 +100,61 @@ export LD_LIBRARY_PATH=/opt/rh/gcc-toolset-13/root/usr/lib64
 /opt/t3/node/bin/node /opt/t3/app/dist/bin.mjs serve --host 0.0.0.0 --port 3773
 ```
 
-A prebuilt `t3-rocky8-linux-x64.tar.gz` may also be attached to the fork's
-GitHub releases (see below).
+A prebuilt `t3-rocky8-linux-x64.tar.gz` is attached to the fork's GitHub
+releases (see below).
+
+## Desktop (Electron AppImage) on Rocky Linux 8.10
+
+`Dockerfile.desktop` builds the Electron desktop for Rocky 8.10 on top of the
+same fixes, plus one desktop-only native: the published
+`@crowecawcaw/xa11y-linux-x64-gnu` snapshot binding targets glibc ≥ 2.39, so it
+is rebuilt from its tagged source (`v0.13.0`) with Rust 1.90 exactly like
+`libfff_c.so`. Both rebuilds are swapped into electron-builder's staged app
+via `T3CODE_DESKTOP_NATIVE_OVERRIDE_DIR` (a small fork addition in
+`scripts/build-desktop-artifact.ts`; unset = stock behavior). `node-pty` is
+recompiled for Electron 44 by electron-builder's own npmRebuild step using the
+container's gcc-toolset-13; resource-monitor, the capture helpers, and
+browser-secret compile from source in the same builder (t3's own Rust crates
+use stable Rust — their locked dependencies need it — while the fff/xa11y
+rebuilds stay pinned to Rust 1.90 for glibc 2.28 output).
+
+Build from the repo root (default target self-tests the AppImage):
+
+```bash
+docker build -f packaging/rocky8/Dockerfile.desktop -t t3desk-rocky8:local .
+```
+
+Extract the AppImage from the image:
+
+```bash
+id="$(docker create t3desk-rocky8:local)" && docker cp "$id:/opt/t3desk/." . && docker rm "$id"
+```
+
+Run on a Rocky 8.10 desktop. Most dependencies ship with a GNOME install; FUSE
+(AppImage mounts) may need adding, and minimal installs want the full set:
+
+```bash
+sudo dnf install -y fuse
+# minimal systems, full Electron runtime set:
+sudo dnf install -y gtk3 nss nspr libdrm mesa-libgbm alsa-lib at-spi2-atk \
+  libXcomposite libXdamage libXrandr libxkbcommon pango cairo cups-libs \
+  libX11 libXext libXfixes libxcb libsecret fuse
+chmod +x T3-Code-*-x64.AppImage
+./T3-Code-*-x64.AppImage
+```
+
+`scripts/desktop-smoke.sh` is the acceptance check (also the `selftest` stage):
+
+1. extracts the AppImage and asserts every ELF payload resolves its shared
+   libraries on glibc 2.28,
+2. unpacks `app.asar` and runs the bundled backend under Electron's Node:
+   `--version`, a `node-pty` spawn, an `fff` index + search, and an `xa11y`
+   load,
+3. boots the GUI under Xvfb and asserts a t3 window appears,
+4. when `/dev/fuse` exists, also runs the AppImage directly via FUSE.
+
+(Root containers need `--no-sandbox`, a Chromium restriction unrelated to
+Rocky; regular desktop users run without it.)
 
 ## Staying up to date (automated releases)
 
@@ -126,8 +179,9 @@ Actions tab; a red build creates no release.
 
 Published artifacts per tag:
 
-- Image: `ghcr.io/pauljones0/t3code-rocky8:<tag>` (and `:latest`)
-- Tarball: `t3-rocky8-linux-x64.tar.gz` on the release page
+- Backend image: `ghcr.io/pauljones0/t3code-rocky8:<tag>` (and `:latest`)
+- Backend tarball: `t3-rocky8-linux-x64.tar.gz` on the release page
+- Desktop AppImage: `T3-Code-*-x64.AppImage` on the release page
 
 To verify CI without cutting a release, use Actions → `rocky8-backend-release`
 → Run workflow: it builds, self-tests, and uploads the tarball as a run
@@ -143,8 +197,13 @@ artifact instead.
   the lockfile-pinned versions, applies the repo's `fff-node` patch (the
   `require` export the server loader needs), and swaps in the rebuilt `.so`.
 - `scripts/smoke-test.sh` — acceptance check (also the `selftest` stage).
-- `.github/workflows/rocky8-backend-release.yml` — tag-driven CI: build,
-  selftest, GHCR push, release tarball.
+- `.github/workflows/rocky8-backend-release.yml` — tag-driven CI: backend +
+  desktop builds, selftests, GHCR push, release assets.
+- `Dockerfile.desktop` — Rocky 8.10 Electron AppImage build (`builder`,
+  `tester`, `selftest` stages).
+- `scripts/build-xa11y.sh` — rebuilds the xa11y napi binding for glibc 2.28.
+- `scripts/desktop-smoke.sh` — desktop acceptance check (also the `selftest`
+  stage).
 
 ## Source / fork
 
