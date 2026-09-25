@@ -1,0 +1,98 @@
+name: rocky8-backend-release
+
+# One-step Rocky 8.10 backend releases: push a tag, get a tested release.
+#
+#   git tag rocky8-v0.0.42-1 && git push fork rocky8-v0.0.42-1
+#
+# Tag convention: rocky8-v<VERSION>[-N], where VERSION is the t3 backend
+# version (apps/server/package.json) and N disambiguates rebuilds of the same
+# backend version (packaging fixes, base image refreshes, ...).
+#
+# What a tag run does:
+#   1. docker build (default target = selftest, so the build itself boots the
+#      server and runs packaging/rocky8/scripts/smoke-test.sh; red = no release)
+#   2. pushes the clean `runtime` image to GHCR (tag + latest)
+#   3. extracts /app + Node runtime into t3-rocky8-linux-x64.tar.gz
+#   4. creates the GitHub release for the tag with the tarball attached
+#
+# Manual runs (Actions -> Run workflow) do steps 1+3 only and upload the
+# tarball as a run artifact instead of cutting a release.
+
+on:
+  push:
+    tags:
+      - "rocky8-*"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # create the tag release
+  packages: write # push the image to GHCR
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Build Rocky 8.10 backend (runs in-build selftest)
+        run: docker build -f packaging/rocky8/Dockerfile -t t3-rocky8:ci .
+
+      - name: Assemble bare-metal tarball
+        run: |
+          set -euo pipefail
+          cid="$(docker create t3-rocky8:ci)"
+          mkdir -p t3dist
+          docker cp "$cid:/app" t3dist/app
+          docker cp "$cid:/usr/local" t3dist/node
+          docker rm "$cid" >/dev/null
+          tar -czf t3-rocky8-linux-x64.tar.gz -C t3dist .
+          ls -la t3-rocky8-linux-x64.tar.gz
+          test -f t3dist/app/dist/bin.mjs
+          test -f t3dist/app/dist/client/index.html
+
+      - name: Upload tarball artifact (manual runs only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: t3-rocky8-linux-x64
+          path: t3-rocky8-linux-x64.tar.gz
+          if-no-files-found: error
+
+      - name: Push image to GHCR (tag runs only)
+        if: startsWith(github.ref, 'refs/tags/rocky8-')
+        env:
+          REGISTRY: ghcr.io
+          IMAGE: ghcr.io/pauljones0/t3code-rocky8
+        run: |
+          set -euo pipefail
+          tag="$(echo '${{ github.ref_name }}' | tr '[:upper:]' '[:lower:]')"
+          # Re-tag the clean runtime stage (cached; skips the selftest layer).
+          docker build -f packaging/rocky8/Dockerfile --target runtime \
+            -t "$IMAGE:$tag" -t "$IMAGE:latest" .
+          echo '${{ secrets.GITHUB_TOKEN }}' | docker login "$REGISTRY" -u '${{ github.actor }}' --password-stdin
+          docker push "$IMAGE:$tag"
+          docker push "$IMAGE:latest"
+
+      - name: Create release (tag runs only)
+        if: startsWith(github.ref, 'refs/tags/rocky8-')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          t3ver="$(node -p "require('./apps/server/package.json').version")"
+          tag='${{ github.ref_name }}'
+          image="ghcr.io/pauljones0/t3code-rocky8:$(echo "$tag" | tr '[:upper:]' '[:lower:]')"
+          gh release create "$tag" t3-rocky8-linux-x64.tar.gz \
+            --title "Rocky 8.10 backend ($tag)" \
+            --notes "t3 backend v$t3ver built and self-tested on Rocky Linux 8.10.
+
+          Commit: ${{ github.sha }}
+          Build: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          - Docker image: \`$image\` (also \`:latest\`)
+            \`docker run --rm -p 3773:3773 -v t3data:/data $image\`
+          - Tarball: \`t3-rocky8-linux-x64.tar.gz\` — the tested /app tree plus the Node 24 runtime for bare-metal Rocky 8.10 hosts.
+
+          The build ran the in-image selftest (CLI, node-pty, rebuilt libfff_c.so file search, server boot, web client served, RPC auth gate, sqlite migrations). Install and verify steps: \`packaging/rocky8/README.md\`."
