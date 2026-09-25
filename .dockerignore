@@ -1,0 +1,15 @@
+# Rocky 8 backend image: keep the build context small.
+.git
+.repos
+**/node_modules
+apps/*/dist
+apps/*/dist-exe
+apps/*/dist-electron
+infra/*/dist
+packages/*/dist
+.vite-plus
+apps/*/.vite-plus
+packages/*/.vite-plus
+*.tsbuildinfo
+release
+dist
