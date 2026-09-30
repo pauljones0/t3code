@@ -1,0 +1,262 @@
+name: rocky8-backend-release
+
+# Rocky 8.10 releases: daily auto-publish plus manual tags.
+#
+# Daily (06:19 UTC): the sync job rebases rocky8-backend onto upstream
+# pingdotgg/t3code main. If upstream moved (or the branch HEAD was never
+# released, e.g. after a flaky run), it pushes the branch, syncs fork main,
+# and the backend/desktop jobs build + self-test; the release job then cuts
+# `rocky8-v<VERSION>-<YYYYMMDD>-<upstream-sha>` with tarball + AppImage and
+# pushes the backend image to GHCR. Quiet days do nothing (jobs skip).
+#
+# Manual tags still work exactly as before:
+#   git tag rocky8-v0.0.43 && git push fork rocky8-v0.0.43
+#
+# Manual "publish now": Actions -> Run workflow with publish=true runs the
+# same daily flow on demand. Plain dispatch builds both artifacts without
+# releasing (proves CI without side effects).
+#
+# A red build anywhere creates no release. A conflicted rebase fails before
+# pushing anything; resolve on rocky8-backend and re-run.
+
+on:
+  push:
+    tags:
+      - "rocky8-*"
+  schedule:
+    - cron: "19 6 * * *"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Run the full daily-publish flow (rebase, build, release)"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write # push branch/main/tags, create releases
+  packages: write # push the backend image to GHCR
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      skip: ${{ steps.resolve.outputs.skip }}
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v6
+        with:
+          ref: rocky8-backend
+          fetch-depth: 0
+
+      - name: Resolve build ref (rebase on schedule/publish runs)
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/pingdotgg/t3code.git 2>/dev/null || true
+          git fetch origin rocky8-backend main 2>&1 | tail -n 1
+          git fetch upstream main 2>&1 | tail -n 1
+
+          EVENT="${{ github.event_name }}"
+          DO_PUBLISH=false
+          if [[ "$EVENT" == "schedule" ]]; then DO_PUBLISH=true; fi
+          if [[ "$EVENT" == "workflow_dispatch" && "${{ inputs.publish }}" == "true" ]]; then DO_PUBLISH=true; fi
+
+          if [[ "$EVENT" == "push" ]]; then
+            # Manual tag: build the tagged commit (must be on our branch).
+            git fetch origin tag "${{ github.ref_name }}" 2>&1 | tail -n 1
+            SHA="$(git rev-parse "${{ github.ref }}")"
+            if ! git merge-base --is-ancestor "$SHA" origin/rocky8-backend; then
+              echo "::error::tag ${{ github.ref_name }} is not on rocky8-backend; tag the release branch."
+              exit 1
+            fi
+            {
+              echo "sha=$SHA"
+              echo "tag=${{ github.ref_name }}"
+              echo "skip=false"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git checkout -q origin/rocky8-backend -B work
+          if [[ "$DO_PUBLISH" == "true" ]]; then
+            BASE="$(git rev-parse origin/rocky8-backend)"
+            UPSTREAM="$(git rev-parse upstream/main)"
+            REBASED=false
+            if ! git merge-base --is-ancestor "$UPSTREAM" "$BASE"; then
+              git rebase upstream/main || {
+                git rebase --abort
+                echo "::error::rebase onto upstream/main conflicted; resolve manually on rocky8-backend."
+                exit 1
+              }
+              git push origin work:rocky8-backend --force-with-lease="rocky8-backend:$BASE"
+              REBASED=true
+            fi
+            SHA="$(git rev-parse "$([[ "$REBASED" == "true" ]] && echo HEAD || echo "$BASE")")"
+            # Already published? (covers retries after flakes: same HEAD, no release yet -> proceed.)
+            if [[ "$REBASED" == "false" ]] && gh api "repos/${{ github.repository }}/releases" --jq -e \
+              '.[] | select(.target_commitish == "'"$SHA"'")' >/dev/null 2>&1; then
+              echo "HEAD $SHA is already released and upstream has not moved; nothing to do."
+              {
+                echo "sha=$SHA"
+                echo "tag="
+                echo "skip=true"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Sync fork main = new upstream + workflow registration (idempotent).
+            git checkout -q "$UPSTREAM" -B mainsync
+            git checkout "$SHA" -- .github/workflows/rocky8-backend-release.yml
+            git commit -qm "rocky8: register release workflow on main (enables manual dispatch)" || true
+            if [[ "$(git rev-parse 'HEAD^{tree}')" != "$(git rev-parse 'origin/main^{tree}')" ]]; then
+              git push origin mainsync:main --force-with-lease="main:$(git rev-parse origin/main)"
+            else
+              echo "fork main already in sync; skipping main push."
+            fi
+            VERSION="$(git show "$SHA:apps/server/package.json" | node -p "JSON.parse(require('fs').readFileSync(0)).version")"
+            TAG="rocky8-v${VERSION}-$(date -u +%Y%m%d)-${UPSTREAM:0:7}"
+            {
+              echo "sha=$SHA"
+              echo "tag=$TAG"
+              echo "skip=false"
+            } >> "$GITHUB_OUTPUT"
+          else
+            # Plain dispatch: build the branch as-is, no release.
+            {
+              echo "sha=$(git rev-parse origin/rocky8-backend)"
+              echo "tag="
+              echo "skip=false"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+  backend:
+    needs: [sync]
+    if: needs.sync.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - name: Build Rocky 8.10 backend (runs in-build selftest)
+        run: docker build -f packaging/rocky8/Dockerfile -t t3-rocky8:ci .
+
+      - name: Assemble bare-metal tarball
+        run: |
+          set -euo pipefail
+          cid="$(docker create t3-rocky8:ci)"
+          mkdir -p t3dist
+          docker cp "$cid:/app" t3dist/app
+          docker cp "$cid:/usr/local" t3dist/node
+          docker rm "$cid" >/dev/null
+          tar -czf t3-rocky8-linux-x64.tar.gz -C t3dist .
+          ls -la t3-rocky8-linux-x64.tar.gz
+          test -f t3dist/app/dist/bin.mjs
+          test -f t3dist/app/dist/client/index.html
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-tarball
+          path: t3-rocky8-linux-x64.tar.gz
+          if-no-files-found: error
+
+      - name: Push image to GHCR (publishing runs only)
+        if: needs.sync.outputs.tag != ''
+        env:
+          REGISTRY: ghcr.io
+          IMAGE: ghcr.io/pauljones0/t3code-rocky8
+        run: |
+          set -euo pipefail
+          tag="$(echo '${{ needs.sync.outputs.tag }}' | tr '[:upper:]' '[:lower:]')"
+          # Re-tag the clean runtime stage (cached; skips the selftest layer).
+          docker build -f packaging/rocky8/Dockerfile --target runtime \
+            -t "$IMAGE:$tag" -t "$IMAGE:latest" .
+          echo '${{ secrets.GITHUB_TOKEN }}' | docker login "$REGISTRY" -u '${{ github.actor }}' --password-stdin
+          docker push "$IMAGE:$tag"
+          docker push "$IMAGE:latest"
+
+  desktop:
+    needs: [sync]
+    if: needs.sync.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - name: Build Rocky 8.10 desktop AppImage (runs in-build selftest)
+        run: docker build -f packaging/rocky8/Dockerfile.desktop -t t3desk-rocky8:ci .
+
+      - name: Extract AppImage
+        run: |
+          set -euo pipefail
+          cid="$(docker create t3desk-rocky8:ci)"
+          mkdir -p deskdist
+          docker cp "$cid:/opt/t3desk/." deskdist/
+          docker rm "$cid" >/dev/null
+          ls -la deskdist/
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-appimage
+          path: deskdist/*.AppImage
+          if-no-files-found: error
+
+  release:
+    needs: [sync, backend, desktop]
+    if: needs.sync.outputs.tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          t3ver="$(node -p "require('./apps/server/package.json').version")"
+          tag='${{ needs.sync.outputs.tag }}'
+          image="ghcr.io/pauljones0/t3code-rocky8:$(echo "$tag" | tr '[:upper:]' '[:lower:]')"
+          ls -la release-assets/
+          TARGET_ARGS=()
+          if [[ "${{ github.event_name }}" != "push" ]]; then
+            # Automated runs mint the tag here; manual tags were pushed already.
+            TARGET_ARGS=(--target '${{ needs.sync.outputs.sha }}')
+          fi
+          gh release create "$tag" release-assets/* \
+            "${TARGET_ARGS[@]}" \
+            --title "Rocky 8.10 backend + desktop ($tag)" \
+            --notes "t3 v$t3ver built and self-tested on Rocky Linux 8.10.
+
+          Commit: ${{ needs.sync.outputs.sha }}
+          Build: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          - Backend Docker image: \`$image\` (also \`:latest\`)
+            \`docker run --rm -p 3773:3773 -v t3data:/data $image\`
+          - Backend tarball: \`t3-rocky8-linux-x64.tar.gz\` — the tested /app tree plus the Node 24 runtime for bare-metal Rocky 8.10 hosts.
+          - Desktop AppImage: \`T3-Code-*.AppImage\` — Electron desktop for Rocky 8.10 (see host package list in packaging/rocky8/README.md).
+
+          Both builds ran their in-image selftests (backend: CLI, natives, server boot, web client, RPC gate, sqlite; desktop: ELF sweep, backend under Electron Node, GUI window under Xvfb). Install and verify steps: \`packaging/rocky8/README.md\`."
